@@ -1,11 +1,7 @@
 """Bill PDF layout parser.
 
-This module intentionally exposes a single public function:
-
+Public API:
     parse_bill_pdf(pdf_path: str, config: dict | None = None) -> dict
-
-All parsing internals (PDF preprocessing, optional DocLayout call, optional Qwen
-call, section post-processing, and fallback logic) are centralized in this file.
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 try:
     import fitz  # pymupdf
@@ -38,9 +34,7 @@ _ALLOWED_PAGE_TYPES: set[str] = {
     "bill_charge_page",
     "bill_detail_page",
 }
-
 _ALLOWED_STRUCTURE_TYPES: set[str] = {"table", "text", "kv", "image"}
-
 _ALLOWED_REGION_TYPES: set[str] = {
     "page_footer",
     "page_number",
@@ -58,11 +52,15 @@ _ALLOWED_REGION_TYPES: set[str] = {
 }
 
 
+class OCRProcessorProtocol(Protocol):
+    def process(self, img_path: str) -> list[dict[str, Any]]: ...
+
+
 @dataclass(slots=True)
 class ParserConfig:
-    """Runtime configuration for parser internals."""
+    """Runtime configuration."""
 
-    doclayout_url: str = ""
+    ocr_processor: OCRProcessorProtocol | None = None
     qwen_url: str = ""
     qwen_model_name: str = "qwen3.5-35b"
     api_key: str = ""
@@ -72,13 +70,13 @@ class ParserConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ParserConfig":
-        """Build config from external input dictionary."""
         if data is None:
             return cls()
         timeout_val = data.get("timeout", data.get("request_timeout_s", 15.0))
         headers = data.get("headers") if isinstance(data.get("headers"), dict) else None
+        ocr_processor = data.get("ocr_processor")
         return cls(
-            doclayout_url=str(data.get("doclayout_url", "")),
+            ocr_processor=ocr_processor,
             qwen_url=str(data.get("qwen_url", "")),
             qwen_model_name=str(data.get("qwen_model_name", "qwen3.5-35b")),
             api_key=str(data.get("api_key", "")),
@@ -90,31 +88,29 @@ class ParserConfig:
 
 @dataclass(slots=True)
 class Block:
-    """Unified block representation used across PDF/OCR/model outputs."""
+    """Unified internal block."""
 
     block_id: str
     text: str
-    bbox: list[float]  # absolute [x1, y1, x2, y2]
+    bbox: list[float]
     page_index: int
     source: str
+    block_type: str = "text"
+    confidence: float = 1.0
 
 
 @dataclass(slots=True)
 class SectionCandidate:
-    """Internal section candidate structure before final serialization."""
-
     section_id: str
     region_type: str
     structure_type: str
-    bbox: list[float]  # absolute [x1, y1, x2, y2]
+    bbox: list[float]
     source_block_ids: list[str]
     confidence: float
 
 
 @dataclass(slots=True)
 class PageImage:
-    """Rendered page image container for downstream model calls and crops."""
-
     page_index: int
     width: int
     height: int
@@ -126,8 +122,6 @@ class PageImage:
 
 @dataclass(slots=True)
 class PageParseResult:
-    """Per-page intermediate parse result."""
-
     page_index: int
     page_type: str
     width: float
@@ -138,17 +132,16 @@ class PageParseResult:
 
 
 class QwenResponseParseError(ValueError):
-    """Raised when Qwen text response cannot be converted to JSON object."""
+    """Raised when qwen output is not valid JSON object."""
 
 
 class BillLayoutParser:
-    """Internal parser engine that powers :func:`parse_bill_pdf`."""
+    """Internal parser engine."""
 
     def __init__(self, config: ParserConfig) -> None:
         self._config = config
 
     def parse(self, pdf_path: str) -> dict[str, list[dict[str, Any]]]:
-        """Parse a bill PDF file path into the final structured dictionary."""
         path = Path(pdf_path)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -157,17 +150,16 @@ class BillLayoutParser:
 
         doc = self._load_pdf(path)
         output_data: list[dict[str, Any]] = []
-
         try:
             for page_index in range(doc.page_count):
                 page = doc.load_page(page_index)
                 page_image = self._render_page(page, page_index)
                 pdf_blocks = self._extract_pdf_blocks(page, page_index)
-                doclayout_result = self._call_doclayout(page_image)
-                merged_blocks = self._merge_pdf_and_ocr_blocks(pdf_blocks, doclayout_result.get("ocr_blocks", []))
+                ocr_blocks = self._call_ocr_processor(page_image)
+                merged_blocks = self._merge_pdf_and_ocr_blocks(pdf_blocks, ocr_blocks)
 
                 try:
-                    qwen_result = self._call_qwen(page_image, merged_blocks, doclayout_result)
+                    qwen_result = self._call_qwen(page_image, pdf_blocks, ocr_blocks)
                     page_type = str(qwen_result.get("page_type", "bill_summary_page"))
                     section_candidates = qwen_result.get("sections", [])
                 except Exception as exc:  # noqa: BLE001
@@ -187,12 +179,12 @@ class BillLayoutParser:
                     section_candidates=section_candidates,
                     page_image=page_image,
                 )
-                page_sections = self._resolve_sections(page_result)
+
                 output_data.append(
                     {
                         "page_index": page_index,
                         "page_type": page_type,
-                        "page_sections": page_sections,
+                        "page_sections": self._resolve_sections(page_result),
                     }
                 )
         finally:
@@ -201,7 +193,6 @@ class BillLayoutParser:
         return {"output_data": output_data}
 
     def _load_pdf(self, pdf_path: Path) -> Any:
-        """Open PDF with PyMuPDF; raise clean error when it fails."""
         if fitz is None:
             raise RuntimeError("PyMuPDF (fitz) is required but not installed")
         try:
@@ -210,7 +201,6 @@ class BillLayoutParser:
             raise ValueError(f"Failed to open PDF: {pdf_path}") from exc
 
     def _render_page(self, page: Any, page_index: int) -> PageImage:
-        """Render page to RGB image container used by downstream calls and crops."""
         pix = page.get_pixmap(colorspace=fitz.csRGB, alpha=False) if fitz is not None else page.get_pixmap(alpha=False)
         return PageImage(
             page_index=page_index,
@@ -223,7 +213,6 @@ class BillLayoutParser:
         )
 
     def _extract_pdf_blocks(self, page: Any, page_index: int) -> list[Block]:
-        """Extract native PDF text blocks and filter empty text."""
         blocks: list[Block] = []
         for idx, raw in enumerate(page.get_text("blocks")):
             if len(raw) < 5:
@@ -232,127 +221,77 @@ class BillLayoutParser:
             txt = str(text).strip()
             if not txt:
                 continue
-            blocks.append(Block(f"p{page_index}_b{idx}", txt, [float(x1), float(y1), float(x2), float(y2)], page_index, "pdf_text"))
+            blocks.append(
+                Block(
+                    block_id=f"p{page_index}_b{idx}",
+                    text=txt,
+                    bbox=[float(x1), float(y1), float(x2), float(y2)],
+                    page_index=page_index,
+                    source="pdf_text",
+                    block_type="text",
+                    confidence=1.0,
+                )
+            )
         return blocks
 
-    def _image_to_base64(self, page_image: PageImage) -> str:
-        """Encode page PNG bytes to base64 string."""
-        return base64.b64encode(page_image.image_bytes).decode("ascii")
+    def _call_ocr_processor(self, page_image: PageImage) -> list[Block]:
+        """Call injected OCR/layout processor and normalize to internal Block list."""
+        processor = self._config.ocr_processor
+        if processor is None:
+            return []
 
-    def _call_doclayout(self, page_image: PageImage) -> dict[str, Any]:
-        """Call OCR processor service and normalize returned block list.
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+                tmp.write(page_image.image_bytes)
+                tmp.flush()
+                raw_items = processor.process(tmp.name)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("ocr_processor.process failed: %s", exc)
+            return []
 
-        Expected processor contract (reference):
-        - request includes `imgpath`
-        - response returns block list where
-          - `coordinate` is bbox
-          - `label` is type (`text` / `image`)
-          - `score` is confidence
-        """
-        if not self._config.doclayout_url or requests is None:
-            return {"layout_blocks": [], "ocr_blocks": []}
+        if not isinstance(raw_items, list):
+            return []
 
-        headers = {"Content-Type": "application/json", **(self._config.headers or {})}
-
-        # Keep compatibility with processors expecting a local image path.
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=True) as tmp:
-            tmp.write(page_image.image_bytes)
-            tmp.flush()
-
-            payload = {
-                "imgpath": tmp.name,
-                "page_index": page_image.page_index,
-                "image_format": page_image.image_format,
-                # keep fallback channel for services not reading local paths
-                "image_base64": self._image_to_base64(page_image),
-            }
-
-            try:
-                response = requests.post(
-                    self._config.doclayout_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=self._config.request_timeout_s,
-                )
-                response.raise_for_status()
-                return self._parse_doclayout_response(response.json(), page_image.page_index)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("DocLayout/OCR processor call failed: %s", exc)
-                return {"layout_blocks": [], "ocr_blocks": []}
-
-    def _parse_doclayout_response(self, response_json: dict[str, Any] | list[Any] | str, page_index: int) -> dict[str, Any]:
-        """Parse possibly unstable DocLayout response into canonical fields."""
-        data: Any = response_json
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except Exception:  # noqa: BLE001
-                return {"layout_blocks": [], "ocr_blocks": []}
-
-        if isinstance(data, list):
-            data = {"layout_blocks": data}
-        if not isinstance(data, dict):
-            return {"layout_blocks": [], "ocr_blocks": []}
-
-        # processor may return either separated fields or one merged block list
-        merged_blocks_raw = data.get("blocks") or data.get("result") or data.get("data") or []
-        layout_raw = data.get("layout_blocks") or data.get("layout") or data.get("regions") or data.get("detections") or []
-        ocr_raw = data.get("ocr_blocks") or data.get("ocr") or data.get("text_blocks") or []
-        if isinstance(merged_blocks_raw, list):
-            for item in merged_blocks_raw:
-                if not isinstance(item, dict):
-                    continue
-                label = str(item.get("label", item.get("type", ""))).strip().lower()
-                if label in {"text", "ocr_text"}:
-                    ocr_raw = [*ocr_raw, item] if isinstance(ocr_raw, list) else [item]
-                elif label:
-                    layout_raw = [*layout_raw, item] if isinstance(layout_raw, list) else [item]
-
-        layout_blocks: list[dict[str, Any]] = []
-        for item in layout_raw if isinstance(layout_raw, list) else []:
+        blocks: list[Block] = []
+        for idx, item in enumerate(raw_items):
             if not isinstance(item, dict):
                 continue
-            bbox = self._coerce_bbox(item) or self._coerce_bbox_from_coordinate(item.get("coordinate"))
+            bbox = self._coerce_bbox_from_coordinate(item.get("coordinate")) or self._coerce_bbox(item)
             if not bbox:
                 continue
-            layout_blocks.append(
-                {
-                    "region_type": str(item.get("region_type") or item.get("label") or "bill_charge_page.charge_items"),
-                    "structure_type": str(item.get("structure_type") or item.get("type") or item.get("label") or "table"),
-                    "bbox": bbox,
-                    "confidence": float(item.get("confidence", item.get("score", 0.0)) or 0.0),
-                }
+            label = str(item.get("label", "text")).strip().lower() or "text"
+            score = max(0.0, min(1.0, float(item.get("score", 0.0) or 0.0)))
+            blocks.append(
+                Block(
+                    block_id=f"p{page_image.page_index}_ocr{idx}",
+                    text="",
+                    bbox=bbox,
+                    page_index=page_image.page_index,
+                    source="ocr_layout",
+                    block_type=label,
+                    confidence=score,
+                )
             )
+        return blocks
 
-        ocr_blocks: list[Block] = []
-        for idx, item in enumerate(ocr_raw if isinstance(ocr_raw, list) else []):
-            if not isinstance(item, dict):
-                continue
-            bbox = self._coerce_bbox(item) or self._coerce_bbox_from_coordinate(item.get("coordinate"))
-            text = str(item.get("text", item.get("content", item.get("label", "")))).strip()
-            if not bbox or not text:
-                continue
-            ocr_blocks.append(Block(f"p{page_index}_ocr{idx}", text, bbox, page_index, "ocr"))
-
-        return {"layout_blocks": layout_blocks, "ocr_blocks": ocr_blocks}
-
-    def _build_qwen_prompt(self, page_index: int, blocks: list[Block], doclayout_result: dict[str, Any]) -> tuple[str, str]:
-        """Build stable system/user prompts with explicit schema and label constraints."""
-        system_prompt = (
-            "You are a bill layout parser. Return ONLY valid JSON and strictly follow allowed labels."
-        )
-        block_preview = [
+    def _build_qwen_prompt(self, page_index: int, pdf_blocks: list[Block], ocr_layout_blocks: list[Block]) -> tuple[str, str]:
+        system_prompt = "You are a bill layout parser. Return ONLY valid JSON with allowed labels."
+        pdf_preview = [
+            {"block_id": b.block_id, "text": b.text[:160], "bbox": b.bbox}
+            for b in pdf_blocks[:80]
+        ]
+        ocr_preview = [
             {
                 "block_id": b.block_id,
-                "text": b.text[:160],
                 "bbox": b.bbox,
-                "source": b.source,
+                "block_type": b.block_type,
+                "confidence": b.confidence,
             }
-            for b in blocks[:80]
+            for b in ocr_layout_blocks[:120]
         ]
         user_prompt = (
             "Task: infer page_type and section candidates.\n"
-            "Output JSON schema:\n"
+            "Output schema:\n"
             "{\n"
             '  "page_type": "bill_summary_page|bill_charge_page|bill_detail_page",\n'
             '  "sections": [\n'
@@ -369,25 +308,24 @@ class BillLayoutParser:
             f"Allowed region_type: {sorted(_ALLOWED_REGION_TYPES)}\n"
             f"Allowed structure_type: {sorted(_ALLOWED_STRUCTURE_TYPES)}\n"
             "Rules:\n"
-            "- bbox should be absolute page coordinates [x1,y1,x2,y2].\n"
-            "- structure_type and region_type are mandatory for every section.\n"
-            "- do NOT create any new labels.\n"
-            "- overlapping candidates are allowed.\n"
-            "- ignore unrelated noise.\n\n"
+            "- region_type must be inferred by you (ocr_layout blocks do not provide region_type).\n"
+            "- bbox must be absolute page coordinates [x1,y1,x2,y2].\n"
+            "- do not create new labels.\n"
+            "- overlapping section candidates are allowed.\n"
+            "- ignore irrelevant noise.\n\n"
             f"page_index={page_index}\n"
-            f"blocks={json.dumps(block_preview, ensure_ascii=False)}\n"
-            f"layout={json.dumps(doclayout_result.get('layout_blocks', []), ensure_ascii=False)}"
+            f"pdf_text_blocks={json.dumps(pdf_preview, ensure_ascii=False)}\n"
+            f"ocr_layout_blocks={json.dumps(ocr_preview, ensure_ascii=False)}"
         )
         return system_prompt, user_prompt
 
-    def _call_qwen(self, page_image: PageImage, blocks: list[Block], doclayout_result: dict[str, Any]) -> dict[str, Any]:
-        """Call Qwen endpoint (OpenAI-style payload) and parse output into candidates."""
+    def _call_qwen(self, page_image: PageImage, pdf_blocks: list[Block], ocr_layout_blocks: list[Block]) -> dict[str, Any]:
         if not self._config.qwen_url:
-            return {"page_type": self._infer_page_type(blocks), "sections": []}
+            return {"page_type": self._infer_page_type(pdf_blocks + ocr_layout_blocks), "sections": []}
         if requests is None:
             raise RuntimeError("requests is required for qwen calls")
 
-        system_prompt, user_prompt = self._build_qwen_prompt(page_image.page_index, blocks, doclayout_result)
+        system_prompt, user_prompt = self._build_qwen_prompt(page_image.page_index, pdf_blocks, ocr_layout_blocks)
         payload = {
             "model": self._config.qwen_model_name,
             "messages": [
@@ -398,7 +336,7 @@ class BillLayoutParser:
                         {"type": "text", "text": user_prompt},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{self._image_to_base64(page_image)}"},
+                            "image_url": {"url": f"data:image/png;base64,{base64.b64encode(page_image.image_bytes).decode('ascii')}"},
                         },
                     ],
                 },
@@ -409,41 +347,37 @@ class BillLayoutParser:
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
 
-        response = requests.post(
+        resp = requests.post(
             self._config.qwen_url,
             json=payload,
             headers=headers,
             timeout=self._config.request_timeout_s,
         )
-        response.raise_for_status()
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
 
         content = ""
         if isinstance(data, dict) and isinstance(data.get("choices"), list) and data.get("choices"):
             message = data["choices"][0].get("message", {}) if isinstance(data["choices"][0], dict) else {}
-            raw_content = message.get("content", "")
-            if isinstance(raw_content, list):
-                content = "\n".join(str(x.get("text", "")) for x in raw_content if isinstance(x, dict))
+            raw = message.get("content", "")
+            if isinstance(raw, list):
+                content = "\n".join(str(x.get("text", "")) for x in raw if isinstance(x, dict))
             else:
-                content = str(raw_content)
+                content = str(raw)
         elif isinstance(data, dict):
             content = str(data.get("output_text", data.get("text", "")))
 
-        parsed_json = self._extract_json_from_llm_response(content)
-        return self._parse_qwen_sections(parsed_json, page_image.page_index)
+        return self._parse_qwen_sections(self._extract_json_from_llm_response(content), page_image.page_index)
 
     def _extract_json_from_llm_response(self, llm_text: str) -> dict[str, Any]:
-        """Extract JSON object from raw LLM text, including markdown code fences."""
         text = llm_text.strip()
         if not text:
             raise QwenResponseParseError("Empty qwen response")
 
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-        candidate = fence_match.group(1) if fence_match else text
-
-        if not fence_match:
-            left = candidate.find("{")
-            right = candidate.rfind("}")
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        candidate = match.group(1) if match else text
+        if not match:
+            left, right = candidate.find("{"), candidate.rfind("}")
             if left != -1 and right != -1 and left < right:
                 candidate = candidate[left : right + 1]
 
@@ -457,86 +391,59 @@ class BillLayoutParser:
         return parsed
 
     def _parse_qwen_sections(self, data: dict[str, Any], page_index: int) -> dict[str, Any]:
-        """Map qwen JSON into page_type + list[SectionCandidate]."""
         page_type = str(data.get("page_type", "bill_summary_page"))
         if page_type not in _ALLOWED_PAGE_TYPES:
             page_type = "bill_summary_page"
 
         sections: list[SectionCandidate] = []
-        raw_sections = data.get("sections", [])
-        if isinstance(raw_sections, list):
-            for idx, sec in enumerate(raw_sections, start=1):
-                if not isinstance(sec, dict):
-                    continue
-                region_type = str(sec.get("region_type", "")).strip()
-                structure_type = str(sec.get("structure_type", "")).strip()
-                if region_type not in _ALLOWED_REGION_TYPES or structure_type not in _ALLOWED_STRUCTURE_TYPES:
-                    continue
-                bbox = self._coerce_bbox(sec)
-                if not bbox:
-                    continue
-                raw_ids = sec.get("source_block_ids", [])
-                source_ids = [str(x) for x in raw_ids if isinstance(x, (str, int, float))]
-                confidence = max(0.0, min(1.0, float(sec.get("confidence", 0.6))))
-                sections.append(SectionCandidate(f"p{page_index}_q{idx}", region_type, structure_type, bbox, source_ids, confidence))
-
+        for idx, sec in enumerate(data.get("sections", []) if isinstance(data.get("sections"), list) else [], start=1):
+            if not isinstance(sec, dict):
+                continue
+            region_type = str(sec.get("region_type", "")).strip()
+            structure_type = str(sec.get("structure_type", "")).strip()
+            if region_type not in _ALLOWED_REGION_TYPES or structure_type not in _ALLOWED_STRUCTURE_TYPES:
+                continue
+            bbox = self._coerce_bbox(sec)
+            if not bbox:
+                continue
+            source_ids = [str(x) for x in sec.get("source_block_ids", []) if isinstance(x, (str, int, float))]
+            confidence = max(0.0, min(1.0, float(sec.get("confidence", 0.6))))
+            sections.append(SectionCandidate(f"p{page_index}_q{idx}", region_type, structure_type, bbox, source_ids, confidence))
         return {"page_type": page_type, "sections": sections}
 
     def _merge_pdf_and_ocr_blocks(self, pdf_blocks: list[Block], ocr_blocks: list[Block]) -> list[Block]:
-        """Keep PDF blocks first, then append non-duplicate OCR blocks."""
         merged = list(pdf_blocks)
         for ocr in ocr_blocks:
-            duplicate = any(
-                self._bbox_iou(ocr.bbox, ex.bbox) >= 0.7 and self._text_similarity(ocr.text, ex.text) >= 0.8
-                for ex in merged
-            )
-            if not duplicate:
+            is_dup = any(self._bbox_iou(ocr.bbox, b.bbox) >= 0.7 and self._text_similarity(ocr.text, b.text) >= 0.8 for b in merged)
+            if not is_dup:
                 merged.append(ocr)
         return merged
 
     def _resolve_sections(self, page_result: PageParseResult) -> list[dict[str, Any]]:
-        """Build final `page_sections` with dedup, bbox fix, normalization, and crop."""
         block_map = {b.block_id: b for b in page_result.blocks}
+        candidates: list[SectionCandidate] = []
 
-        adjusted: list[SectionCandidate] = []
         for sec in page_result.section_candidates:
             bbox = sec.bbox
             rebuilt = self._rebuild_bbox_from_source_blocks(sec.source_block_ids, block_map) if sec.source_block_ids else []
             if rebuilt:
                 bbox = rebuilt
-            bbox = self._clip_bbox(bbox, page_result.width, page_result.height)
-            candidate = SectionCandidate(
-                section_id=sec.section_id,
-                region_type=sec.region_type,
-                structure_type=sec.structure_type,
-                bbox=bbox,
-                source_block_ids=list(sec.source_block_ids),
-                confidence=max(0.0, min(1.0, float(sec.confidence))),
-            )
+            clipped = self._clip_bbox(bbox, page_result.width, page_result.height)
+            candidate = SectionCandidate(sec.section_id, sec.region_type, sec.structure_type, clipped, list(sec.source_block_ids), max(0.0, min(1.0, sec.confidence)))
             if self._validate_section(candidate):
-                adjusted.append(candidate)
+                candidates.append(candidate)
 
-        deduped = self._deduplicate_sections(adjusted, page_result.blocks)
-
-        # Protect small regions (page number/footer) by trimming larger conflicts.
-        small_regions = [s for s in deduped if s.region_type in {"page_number", "page_footer"}]
-        for sec in deduped:
-            if sec.region_type in {"page_number", "page_footer"}:
-                continue
-            for small in small_regions:
-                if self._bbox_iou(sec.bbox, small.bbox) > 0.3:
-                    sec.bbox[3] = min(sec.bbox[3], small.bbox[1])
-                    sec.bbox = self._clip_bbox(sec.bbox, page_result.width, page_result.height)
-
+        deduped = self._deduplicate_sections(candidates, page_result.blocks)
         ordered = sorted(deduped, key=lambda s: (s.bbox[1], s.bbox[0], s.region_type, s.structure_type))
-        final_sections: list[dict[str, Any]] = []
+
+        out: list[dict[str, Any]] = []
         for rank, sec in enumerate(ordered, start=1):
             if not self._validate_section(sec):
                 continue
             norm_bbox = self._normalize_bbox(sec.bbox, page_result.width, page_result.height)
-            final_sections.append(
+            out.append(
                 {
-                    "section_id": self._generate_section_id(page_result.page_index, rank, sec),
+                    "section_id": self._generate_section_id(page_result.page_index, rank),
                     "region_type": sec.region_type,
                     "structure_type": sec.structure_type,
                     "bbox": norm_bbox,
@@ -545,39 +452,32 @@ class BillLayoutParser:
                     "image_base64": self._crop_section_image_base64(page_result.page_image, norm_bbox),
                 }
             )
-
-        return final_sections
+        return out
 
     def _deduplicate_sections(self, sections: list[SectionCandidate], blocks: list[Block]) -> list[SectionCandidate]:
-        """Deduplicate highly overlapping same-region sections with quality scoring."""
         kept: list[SectionCandidate] = []
         block_map = {b.block_id: b for b in blocks}
-
         for sec in sorted(sections, key=lambda s: (-s.confidence, -len(s.source_block_ids))):
-            is_dup = False
-            for idx, ex in enumerate(kept):
+            duplicated = False
+            for i, ex in enumerate(kept):
                 if sec.region_type != ex.region_type:
                     continue
                 if self._bbox_iou(sec.bbox, ex.bbox) <= 0.3:
                     continue
-                score_sec = self._section_quality(sec, block_map)
-                score_ex = self._section_quality(ex, block_map)
-                if score_sec > score_ex:
-                    kept[idx] = sec
-                is_dup = True
+                if self._section_quality(sec, block_map) > self._section_quality(ex, block_map):
+                    kept[i] = sec
+                duplicated = True
                 break
-            if not is_dup:
+            if not duplicated:
                 kept.append(sec)
-
         return kept
 
     def _section_quality(self, section: SectionCandidate, block_map: dict[str, Block]) -> float:
         rebuilt = self._rebuild_bbox_from_source_blocks(section.source_block_ids, block_map)
-        fit_score = self._bbox_iou(section.bbox, rebuilt) if rebuilt else 0.0
-        return section.confidence * 2.0 + len(section.source_block_ids) * 0.05 + fit_score
+        fit = self._bbox_iou(section.bbox, rebuilt) if rebuilt else 0.0
+        return section.confidence * 2.0 + len(section.source_block_ids) * 0.05 + fit
 
     def _rebuild_bbox_from_source_blocks(self, source_block_ids: list[str], block_map: dict[str, Block]) -> list[float]:
-        """Rebuild bbox from source blocks; return [] if none can be resolved."""
         boxes = [block_map[sid].bbox for sid in source_block_ids if sid in block_map]
         if not boxes:
             return []
@@ -589,18 +489,14 @@ class BillLayoutParser:
         ]
 
     def _normalize_bbox(self, bbox: list[float], page_width: float, page_height: float) -> list[float]:
-        """Normalize absolute bbox to [0,1] with coordinate ordering guarantees."""
         clipped = self._clip_bbox(bbox, page_width, page_height)
         if page_width <= 0 or page_height <= 0:
             return [0.0, 0.0, 0.0, 0.0]
-        x1 = max(0.0, min(1.0, clipped[0] / page_width))
-        y1 = max(0.0, min(1.0, clipped[1] / page_height))
-        x2 = max(0.0, min(1.0, clipped[2] / page_width))
-        y2 = max(0.0, min(1.0, clipped[3] / page_height))
-        return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+        x1, y1, x2, y2 = clipped
+        n = [x1 / page_width, y1 / page_height, x2 / page_width, y2 / page_height]
+        return [max(0.0, min(1.0, n[0])), max(0.0, min(1.0, n[1])), max(0.0, min(1.0, n[2])), max(0.0, min(1.0, n[3]))]
 
     def _clip_bbox(self, bbox: list[float], page_width: float, page_height: float) -> list[float]:
-        """Clip bbox into page bounds and enforce x1<=x2, y1<=y2."""
         if len(bbox) != 4 or page_width <= 0 or page_height <= 0:
             return [0.0, 0.0, 0.0, 0.0]
         x1, y1, x2, y2 = [float(v) if isinstance(v, (int, float)) else 0.0 for v in bbox]
@@ -611,41 +507,31 @@ class BillLayoutParser:
         return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
 
     def _crop_section_image_base64(self, page_image: PageImage, bbox_normalized: list[float]) -> str:
-        """Crop normalized region from current page RGB bytes and return base64.
-
-        Falls back to full-page image base64 when bbox is too small or invalid.
-        """
         if len(bbox_normalized) != 4:
             return base64.b64encode(page_image.image_bytes).decode("ascii")
-
         x1 = int(max(0, min(page_image.width - 1, round(bbox_normalized[0] * page_image.width))))
         y1 = int(max(0, min(page_image.height - 1, round(bbox_normalized[1] * page_image.height))))
         x2 = int(max(0, min(page_image.width, round(bbox_normalized[2] * page_image.width))))
         y2 = int(max(0, min(page_image.height, round(bbox_normalized[3] * page_image.height))))
-
         if x2 <= x1 or y2 <= y1 or (x2 - x1) < 2 or (y2 - y1) < 2:
             return base64.b64encode(page_image.image_bytes).decode("ascii")
 
-        row_stride = page_image.width * max(1, page_image.channels)
         channels = max(1, page_image.channels)
-        cropped_rows: list[bytes] = []
+        row_stride = page_image.width * channels
+        chunks: list[bytes] = []
         for y in range(y1, y2):
             start = y * row_stride + x1 * channels
             end = y * row_stride + x2 * channels
-            cropped_rows.append(page_image.rgb_bytes[start:end])
-
-        cropped = b"".join(cropped_rows)
+            chunks.append(page_image.rgb_bytes[start:end])
+        cropped = b"".join(chunks)
         if not cropped:
             return base64.b64encode(page_image.image_bytes).decode("ascii")
         return base64.b64encode(cropped).decode("ascii")
 
-    def _generate_section_id(self, page_index: int, rank: int, section: SectionCandidate) -> str:
-        """Generate stable, predictable section id."""
-        _ = section.region_type
+    def _generate_section_id(self, page_index: int, rank: int) -> str:
         return f"p{page_index}_s{rank}"
 
     def _validate_section(self, section: SectionCandidate) -> bool:
-        """Validate candidate with label/shape/confidence constraints."""
         if section.region_type not in _ALLOWED_REGION_TYPES:
             return False
         if section.structure_type not in _ALLOWED_STRUCTURE_TYPES:
@@ -659,7 +545,6 @@ class BillLayoutParser:
         return True
 
     def _bbox_iou(self, box_a: list[float], box_b: list[float]) -> float:
-        """Compute IoU of two absolute bboxes."""
         if len(box_a) != 4 or len(box_b) != 4:
             return 0.0
         ax1, ay1, ax2, ay2 = box_a
@@ -673,31 +558,25 @@ class BillLayoutParser:
         denom = area_a + area_b - inter
         return inter / denom if denom > 0 else 0.0
 
-    def _text_similarity(self, text_a: str, text_b: str) -> float:
-        """Compute simple text similarity used in OCR/PDF dedup."""
-        return SequenceMatcher(None, text_a.strip().lower(), text_b.strip().lower()).ratio()
+    def _text_similarity(self, a: str, b: str) -> float:
+        return SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
 
     def _coerce_bbox(self, obj: dict[str, Any]) -> list[float]:
-        """Read bbox from common keys and normalize to [x1,y1,x2,y2] absolute format."""
         bbox = obj.get("bbox") or obj.get("box") or obj.get("rect")
         if isinstance(bbox, list) and len(bbox) == 4:
             return [float(v) for v in bbox]
-
         x1 = obj.get("x1", obj.get("left", obj.get("x0")))
         y1 = obj.get("y1", obj.get("top", obj.get("y0")))
         x2 = obj.get("x2", obj.get("right"))
         y2 = obj.get("y2", obj.get("bottom"))
         if all(v is not None for v in [x1, y1, x2, y2]):
             return [float(x1), float(y1), float(x2), float(y2)]
-
         return []
 
     def _coerce_bbox_from_coordinate(self, coordinate: Any) -> list[float]:
-        """Convert processor `coordinate` into [x1,y1,x2,y2] absolute bbox."""
         if isinstance(coordinate, list):
             if len(coordinate) == 4 and all(isinstance(v, (int, float)) for v in coordinate):
                 return [float(v) for v in coordinate]
-            # polygon points [[x,y], ...]
             points: list[tuple[float, float]] = []
             for p in coordinate:
                 if isinstance(p, (list, tuple)) and len(p) >= 2 and isinstance(p[0], (int, float)) and isinstance(p[1], (int, float)):
@@ -709,29 +588,22 @@ class BillLayoutParser:
         return []
 
     def _infer_page_type(self, blocks: list[Block]) -> Literal["bill_summary_page", "bill_charge_page", "bill_detail_page"]:
-        """Heuristic fallback page-type inference for degraded model conditions."""
         texts = [b.text.strip().lower() for b in blocks if b.text.strip()]
         if not texts:
             return "bill_summary_page"
 
         freq: dict[str, int] = {}
-        for text in texts:
-            freq[text] = freq.get(text, 0) + 1
-
+        for t in texts:
+            freq[t] = freq.get(t, 0) + 1
         repeated_lines = sum(1 for c in freq.values() if c >= 2)
         if repeated_lines >= 3 or len(texts) >= 30:
             return "bill_detail_page"
-
-        if any(keyword in t for t in texts for keyword in ["charge", "subtotal", "total", "adjustment"]):
+        if any(k in t for t in texts for k in ["charge", "subtotal", "total", "adjustment"]):
             return "bill_charge_page"
-
         return "bill_summary_page"
 
 
 def parse_bill_pdf(pdf_path: str, config: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
-    """Parse bill PDF and return structured output.
-
-    This is the only public API in this module.
-    """
+    """Parse bill PDF and return final structured dictionary."""
     parser = BillLayoutParser(ParserConfig.from_dict(config))
     return parser.parse(pdf_path)
