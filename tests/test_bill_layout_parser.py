@@ -1,3 +1,4 @@
+from typing import Any
 import re
 import sys
 from pathlib import Path
@@ -18,7 +19,7 @@ from bill_layout_parser import (  # noqa: E402
 )
 
 
-def _fitz_module():
+def _fitz_module() -> Any:
     return pytest.importorskip("fitz")
 
 

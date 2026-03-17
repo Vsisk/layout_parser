@@ -613,7 +613,7 @@ class BillLayoutParser:
 
     def _generate_section_id(self, page_index: int, rank: int, section: SectionCandidate) -> str:
         """Generate stable, predictable section id."""
-        _ = section
+        _ = section.region_type
         return f"p{page_index}_s{rank}"
 
     def _validate_section(self, section: SectionCandidate) -> bool:
