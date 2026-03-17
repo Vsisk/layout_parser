@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -239,29 +240,45 @@ class BillLayoutParser:
         return base64.b64encode(page_image.image_bytes).decode("ascii")
 
     def _call_doclayout(self, page_image: PageImage) -> dict[str, Any]:
-        """Call DocLayout service and return normalized layout/ocr payload."""
+        """Call OCR processor service and normalize returned block list.
+
+        Expected processor contract (reference):
+        - request includes `imgpath`
+        - response returns block list where
+          - `coordinate` is bbox
+          - `label` is type (`text` / `image`)
+          - `score` is confidence
+        """
         if not self._config.doclayout_url or requests is None:
             return {"layout_blocks": [], "ocr_blocks": []}
 
         headers = {"Content-Type": "application/json", **(self._config.headers or {})}
-        payload = {
-            "image_base64": self._image_to_base64(page_image),
-            "page_index": page_image.page_index,
-            "image_format": page_image.image_format,
-        }
 
-        try:
-            response = requests.post(
-                self._config.doclayout_url,
-                json=payload,
-                headers=headers,
-                timeout=self._config.request_timeout_s,
-            )
-            response.raise_for_status()
-            return self._parse_doclayout_response(response.json(), page_image.page_index)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("DocLayout call failed: %s", exc)
-            return {"layout_blocks": [], "ocr_blocks": []}
+        # Keep compatibility with processors expecting a local image path.
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=True) as tmp:
+            tmp.write(page_image.image_bytes)
+            tmp.flush()
+
+            payload = {
+                "imgpath": tmp.name,
+                "page_index": page_image.page_index,
+                "image_format": page_image.image_format,
+                # keep fallback channel for services not reading local paths
+                "image_base64": self._image_to_base64(page_image),
+            }
+
+            try:
+                response = requests.post(
+                    self._config.doclayout_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._config.request_timeout_s,
+                )
+                response.raise_for_status()
+                return self._parse_doclayout_response(response.json(), page_image.page_index)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("DocLayout/OCR processor call failed: %s", exc)
+                return {"layout_blocks": [], "ocr_blocks": []}
 
     def _parse_doclayout_response(self, response_json: dict[str, Any] | list[Any] | str, page_index: int) -> dict[str, Any]:
         """Parse possibly unstable DocLayout response into canonical fields."""
@@ -277,20 +294,31 @@ class BillLayoutParser:
         if not isinstance(data, dict):
             return {"layout_blocks": [], "ocr_blocks": []}
 
+        # processor may return either separated fields or one merged block list
+        merged_blocks_raw = data.get("blocks") or data.get("result") or data.get("data") or []
         layout_raw = data.get("layout_blocks") or data.get("layout") or data.get("regions") or data.get("detections") or []
-        ocr_raw = data.get("ocr_blocks") or data.get("ocr") or data.get("text_blocks") or data.get("blocks") or []
+        ocr_raw = data.get("ocr_blocks") or data.get("ocr") or data.get("text_blocks") or []
+        if isinstance(merged_blocks_raw, list):
+            for item in merged_blocks_raw:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label", item.get("type", ""))).strip().lower()
+                if label in {"text", "ocr_text"}:
+                    ocr_raw = [*ocr_raw, item] if isinstance(ocr_raw, list) else [item]
+                elif label:
+                    layout_raw = [*layout_raw, item] if isinstance(layout_raw, list) else [item]
 
         layout_blocks: list[dict[str, Any]] = []
         for item in layout_raw if isinstance(layout_raw, list) else []:
             if not isinstance(item, dict):
                 continue
-            bbox = self._coerce_bbox(item)
+            bbox = self._coerce_bbox(item) or self._coerce_bbox_from_coordinate(item.get("coordinate"))
             if not bbox:
                 continue
             layout_blocks.append(
                 {
                     "region_type": str(item.get("region_type") or item.get("label") or "bill_charge_page.charge_items"),
-                    "structure_type": str(item.get("structure_type") or item.get("type") or "table"),
+                    "structure_type": str(item.get("structure_type") or item.get("type") or item.get("label") or "table"),
                     "bbox": bbox,
                     "confidence": float(item.get("confidence", item.get("score", 0.0)) or 0.0),
                 }
@@ -300,8 +328,8 @@ class BillLayoutParser:
         for idx, item in enumerate(ocr_raw if isinstance(ocr_raw, list) else []):
             if not isinstance(item, dict):
                 continue
-            bbox = self._coerce_bbox(item)
-            text = str(item.get("text", item.get("content", ""))).strip()
+            bbox = self._coerce_bbox(item) or self._coerce_bbox_from_coordinate(item.get("coordinate"))
+            text = str(item.get("text", item.get("content", item.get("label", "")))).strip()
             if not bbox or not text:
                 continue
             ocr_blocks.append(Block(f"p{page_index}_ocr{idx}", text, bbox, page_index, "ocr"))
@@ -662,6 +690,22 @@ class BillLayoutParser:
         if all(v is not None for v in [x1, y1, x2, y2]):
             return [float(x1), float(y1), float(x2), float(y2)]
 
+        return []
+
+    def _coerce_bbox_from_coordinate(self, coordinate: Any) -> list[float]:
+        """Convert processor `coordinate` into [x1,y1,x2,y2] absolute bbox."""
+        if isinstance(coordinate, list):
+            if len(coordinate) == 4 and all(isinstance(v, (int, float)) for v in coordinate):
+                return [float(v) for v in coordinate]
+            # polygon points [[x,y], ...]
+            points: list[tuple[float, float]] = []
+            for p in coordinate:
+                if isinstance(p, (list, tuple)) and len(p) >= 2 and isinstance(p[0], (int, float)) and isinstance(p[1], (int, float)):
+                    points.append((float(p[0]), float(p[1])))
+            if points:
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                return [min(xs), min(ys), max(xs), max(ys)]
         return []
 
     def _infer_page_type(self, blocks: list[Block]) -> Literal["bill_summary_page", "bill_charge_page", "bill_detail_page"]:

@@ -250,3 +250,34 @@ def test_allowed_labels_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         assert section["structure_type"] in _ALLOWED_STRUCTURE_TYPES
         assert section["region_type"] in _ALLOWED_REGION_TYPES
         assert re.match(r"^p0_s\d+$", section["section_id"])
+
+
+def test_doclayout_processor_coordinate_label_score(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    pdf_path = tmp_path / "processor.pdf"
+    _create_pdf(pdf_path, ["hello"])
+
+    seen_payload: dict[str, Any] = {}
+
+    def _mock_post(url, json, headers, timeout):
+        _ = (headers, timeout)
+        if "doclayout" in url:
+            seen_payload.update(json)
+            return _FakeResponse(
+                {
+                    "blocks": [
+                        {
+                            "coordinate": [[10, 10], [100, 10], [100, 40], [10, 40]],
+                            "label": "text",
+                            "score": 0.88,
+                            "text": "ocr line",
+                        }
+                    ]
+                }
+            )
+        return _FakeResponse({"choices": [{"message": {"content": '{"page_type":"bill_summary_page","sections":[]}'}}]})
+
+    monkeypatch.setattr("bill_layout_parser.requests", SimpleNamespace(post=_mock_post))
+    result = parse_bill_pdf(str(pdf_path), config={"doclayout_url": "http://x/doclayout", "qwen_url": "http://x/qwen"})
+
+    assert "imgpath" in seen_payload
+    assert len(result["output_data"]) == 1
