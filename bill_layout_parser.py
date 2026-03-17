@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -45,9 +46,19 @@ _ALLOWED_STRUCTURE_TYPES: set[str] = {
 }
 
 _ALLOWED_REGION_TYPES: set[str] = {
+    "page_footer",
+    "page_number",
+    "bill_summary_page.telecom_operator_information",
+    "bill_summary_page.marketing_information",
+    "bill_summary_page.account_information",
+    "bill_summary_page.address_and_contact_information",
+    "bill_summary_page.barcode_qr_code",
     "bill_charge_page.charge_items",
-    "bill_summary_page.summary_info",
-    "bill_detail_page.detail_lines",
+    "bill_charge_page.adjustment_charges",
+    "bill_charge_page.installment_payment",
+    "bill_charge_page.transaction_information",
+    "bill_charge_page.invoice_remark_and_explanations",
+    "bill_detail_page.detail_record_display_content",
 }
 
 
@@ -57,6 +68,8 @@ class ParserConfig:
 
     doclayout_url: str = ""
     qwen_url: str = ""
+    qwen_model_name: str = "qwen3.5-35b"
+    api_key: str = ""
     request_timeout_s: float = 15.0
     headers: dict[str, str] | None = None
     include_section_images: bool = False
@@ -71,6 +84,8 @@ class ParserConfig:
         return cls(
             doclayout_url=str(data.get("doclayout_url", "")),
             qwen_url=str(data.get("qwen_url", "")),
+            qwen_model_name=str(data.get("qwen_model_name", "qwen3.5-35b")),
+            api_key=str(data.get("api_key", "")),
             request_timeout_s=float(timeout_val),
             headers=safe_headers,
             include_section_images=bool(data.get("include_section_images", False)),
@@ -124,6 +139,10 @@ class PageParseResult:
     page_image: PageImage
 
 
+class QwenResponseParseError(ValueError):
+    """Raised when Qwen response cannot be parsed into expected JSON."""
+
+
 class BillLayoutParser:
     """Internal parser implementation for bill PDF layout extraction."""
 
@@ -155,12 +174,18 @@ class BillLayoutParser:
                     ocr_blocks=doclayout_result.get("ocr_blocks", []),
                 )
 
-                qwen_result = self._call_qwen(page_image, merged_blocks, doclayout_result)
-                section_candidates = self._merge_blocks(merged_blocks, doclayout_result, qwen_result)
+                try:
+                    qwen_result = self._call_qwen(page_image, merged_blocks, doclayout_result)
+                    page_type = str(qwen_result.get("page_type", "bill_summary_page"))
+                    section_candidates = qwen_result.get("sections", [])
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Qwen call/parse failed, fallback enabled: %s", exc)
+                    page_type = self._infer_page_type(merged_blocks)
+                    section_candidates = []
 
                 page_result = PageParseResult(
                     page_index=page_index,
-                    page_type=str(qwen_result.get("page_type", "bill_charge_page")),
+                    page_type=page_type,
                     width=page_width,
                     height=page_height,
                     blocks=merged_blocks,
@@ -169,7 +194,7 @@ class BillLayoutParser:
                 )
                 sections = self._resolve_sections(page_result)
                 final_page_type = (
-                    page_result.page_type if page_result.page_type in _ALLOWED_PAGE_TYPES else "bill_charge_page"
+                    page_result.page_type if page_result.page_type in _ALLOWED_PAGE_TYPES else self._infer_page_type(merged_blocks)
                 )
                 page_entries.append(
                     self._build_output(
@@ -329,6 +354,183 @@ class BillLayoutParser:
 
         return {"layout_blocks": normalized_layout, "ocr_blocks": normalized_ocr_blocks}
 
+    def _build_qwen_prompt(
+        self,
+        page_index: int,
+        blocks: list[Block],
+        doclayout_result: dict[str, Any],
+    ) -> tuple[str, str]:
+        block_preview = [
+            {
+                "block_id": b.block_id,
+                "text": b.text[:200],
+                "bbox": b.bbox,
+                "source": b.source,
+            }
+            for b in blocks[:80]
+        ]
+        layout_preview = doclayout_result.get("layout_blocks", [])
+
+        system_prompt = (
+            "You are a bill PDF layout parser. "
+            "Return ONLY valid JSON matching the required schema. "
+            "Do not create new labels outside allowed sets."
+        )
+        user_prompt = (
+            "Task: classify page_type and produce section candidates for this bill page.\n"
+            "Output JSON schema:\n"
+            "{\n"
+            '  "page_type": "bill_summary_page|bill_charge_page|bill_detail_page",\n'
+            '  "sections": [\n'
+            "    {\n"
+            '      "region_type": "<allowed region type>",\n'
+            '      "structure_type": "table|text|kv|image",\n'
+            '      "bbox": [x0, y0, x1, y1],\n'
+            '      "source_block_ids": ["..."],\n'
+            '      "confidence": 0.0\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Rules:\n"
+            f"- page_type must be one of: {sorted(_ALLOWED_PAGE_TYPES)}\n"
+            f"- region_type must be one of: {sorted(_ALLOWED_REGION_TYPES)}\n"
+            f"- structure_type must be one of: {sorted(_ALLOWED_STRUCTURE_TYPES)}\n"
+            "- bbox should use page absolute coordinates where possible.\n"
+            "- structure_type and region_type are both mandatory for each section.\n"
+            "- Do not invent any new tag not listed above.\n"
+            "- Overlapping section candidates are allowed; downstream post-processing will resolve.\n"
+            "- Ignore irrelevant noise content.\n\n"
+            f"Page index: {page_index}\n"
+            f"PDF/OCR blocks (preview): {json.dumps(block_preview, ensure_ascii=False)}\n"
+            f"Doclayout regions (preview): {json.dumps(layout_preview, ensure_ascii=False)}\n"
+        )
+        return system_prompt, user_prompt
+
+    def _call_qwen(self, page_image: PageImage, blocks: list[Block], doclayout_result: dict[str, Any]) -> dict[str, Any]:
+        if not self._config.qwen_url:
+            return {"page_type": self._infer_page_type(blocks), "sections": []}
+
+        if requests is None:
+            raise RuntimeError("requests is required for qwen URL call")
+
+        system_prompt, user_prompt = self._build_qwen_prompt(page_image.page_index, blocks, doclayout_result)
+        payload: dict[str, Any] = {
+            "model": self._config.qwen_model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{self._image_to_base64(page_image)}"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.0,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self._config.api_key:
+            headers["Authorization"] = f"Bearer {self._config.api_key}"
+        if self._config.headers:
+            headers.update({str(k): str(v) for k, v in self._config.headers.items()})
+
+        response = requests.post(
+            self._config.qwen_url,
+            json=payload,
+            headers=headers,
+            timeout=self._config.request_timeout_s,
+        )
+        response.raise_for_status()
+        resp_data = response.json()
+
+        content = ""
+        if isinstance(resp_data, dict):
+            choices = resp_data.get("choices", [])
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+                raw_content = message.get("content", "")
+                if isinstance(raw_content, list):
+                    text_parts = []
+                    for part in raw_content:
+                        if isinstance(part, dict) and "text" in part:
+                            text_parts.append(str(part["text"]))
+                    content = "\n".join(text_parts)
+                else:
+                    content = str(raw_content)
+            else:
+                content = str(resp_data.get("output_text", resp_data.get("text", "")))
+
+        parsed_json = self._extract_json_from_llm_response(content)
+        return self._parse_qwen_sections(parsed_json, page_image.page_index)
+
+    def _extract_json_from_llm_response(self, llm_text: str) -> dict[str, Any]:
+        text = llm_text.strip()
+        if not text:
+            raise QwenResponseParseError("Empty response from qwen")
+
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        candidate = fenced.group(1) if fenced else text
+
+        if not fenced:
+            first = candidate.find("{")
+            last = candidate.rfind("}")
+            if first != -1 and last != -1 and first < last:
+                candidate = candidate[first : last + 1]
+
+        try:
+            parsed = json.loads(candidate)
+        except Exception as exc:  # noqa: BLE001
+            raise QwenResponseParseError("Invalid JSON from qwen") from exc
+
+        if not isinstance(parsed, dict):
+            raise QwenResponseParseError("Qwen JSON must be an object")
+        return parsed
+
+    def _parse_qwen_sections(self, data: dict[str, Any], page_index: int) -> dict[str, Any]:
+        raw_page_type = str(data.get("page_type", "")).strip()
+        page_type = raw_page_type if raw_page_type in _ALLOWED_PAGE_TYPES else "bill_summary_page"
+
+        raw_sections = data.get("sections", [])
+        sections: list[SectionCandidate] = []
+        if isinstance(raw_sections, list):
+            for idx, sec in enumerate(raw_sections, start=1):
+                if not isinstance(sec, dict):
+                    continue
+                region_type = str(sec.get("region_type", "")).strip()
+                structure_type = str(sec.get("structure_type", "")).strip()
+                if region_type not in _ALLOWED_REGION_TYPES:
+                    continue
+                if structure_type not in _ALLOWED_STRUCTURE_TYPES:
+                    continue
+
+                bbox = self._coerce_bbox(sec)
+                if not bbox:
+                    continue
+
+                raw_ids = sec.get("source_block_ids", [])
+                source_ids = [str(v) for v in raw_ids if isinstance(v, (str, int, float))]
+                confidence = float(sec.get("confidence", 0.6))
+
+                sections.append(
+                    SectionCandidate(
+                        section_id=f"s{idx}",
+                        region_type=region_type,
+                        structure_type=structure_type,
+                        bbox=bbox,
+                        source_block_ids=source_ids,
+                        confidence=confidence,
+                    )
+                )
+
+        for i, sec in enumerate(sections, start=1):
+            sec.section_id = f"p{page_index}_q{i}"
+
+        return {"page_type": page_type, "sections": sections}
+
     def _merge_pdf_and_ocr_blocks(self, pdf_blocks: list[Block], ocr_blocks: list[Block]) -> list[Block]:
         merged: list[Block] = list(pdf_blocks)
         for ocr in ocr_blocks:
@@ -374,61 +576,30 @@ class BillLayoutParser:
             return [float(x0), float(y0), float(x1), float(y1)]
         return []
 
-    def _call_qwen(self, page_image: PageImage, blocks: list[Block], doclayout_result: dict[str, Any]) -> dict[str, Any]:
-        _ = page_image
-        _ = blocks
-        _ = doclayout_result
-        return {
-            "page_type": "bill_charge_page",
-            "default_structure_type": "text",
-        }
+    def _infer_page_type(self, blocks: list[Block]) -> Literal["bill_summary_page", "bill_charge_page", "bill_detail_page"]:
+        texts = [b.text.strip().lower() for b in blocks if b.text.strip()]
+        if not texts:
+            return "bill_summary_page"
 
-    def _merge_blocks(
-        self,
-        blocks: list[Block],
-        doclayout_result: dict[str, Any],
-        qwen_result: dict[str, Any],
-    ) -> list[SectionCandidate]:
-        layout_blocks = doclayout_result.get("layout_blocks", [])
-        candidates: list[SectionCandidate] = []
-        for idx, region in enumerate(layout_blocks if isinstance(layout_blocks, list) else [], start=1):
-            if not isinstance(region, dict):
-                continue
-            bbox = region.get("bbox")
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                continue
-            candidates.append(
-                SectionCandidate(
-                    section_id=f"s{idx}",
-                    region_type=str(region.get("region_type", "bill_charge_page.charge_items")),
-                    structure_type=str(region.get("structure_type", qwen_result.get("default_structure_type", "text"))),
-                    bbox=[float(v) for v in bbox],
-                    source_block_ids=[b.block_id for b in blocks],
-                    confidence=float(region.get("confidence", 0.0)),
-                )
-            )
+        freq: dict[str, int] = {}
+        for t in texts:
+            freq[t] = freq.get(t, 0) + 1
+        repeated_lines = sum(1 for c in freq.values() if c >= 2)
+        if repeated_lines >= 3 or len(texts) >= 30:
+            return "bill_detail_page"
 
-        if not candidates and blocks:
-            x0 = min(b.bbox[0] for b in blocks)
-            y0 = min(b.bbox[1] for b in blocks)
-            x1 = max(b.bbox[2] for b in blocks)
-            y1 = max(b.bbox[3] for b in blocks)
-            candidates.append(
-                SectionCandidate(
-                    section_id="s1",
-                    region_type="bill_charge_page.charge_items",
-                    structure_type=str(qwen_result.get("default_structure_type", "text")),
-                    bbox=[x0, y0, x1, y1],
-                    source_block_ids=[b.block_id for b in blocks],
-                    confidence=0.5,
-                )
-            )
-        return candidates
+        charge_keywords = ["charge", "subtotal", "total", "adjustment"]
+        if any(any(k in t for k in charge_keywords) for t in texts):
+            return "bill_charge_page"
+
+        return "bill_summary_page"
 
     def _resolve_sections(self, page_result: PageParseResult) -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
         for idx, candidate in enumerate(page_result.section_candidates, start=1):
             structure_type = candidate.structure_type if candidate.structure_type in _ALLOWED_STRUCTURE_TYPES else "text"
+            if candidate.region_type not in _ALLOWED_REGION_TYPES:
+                continue
             normalized_bbox = self._normalize_bbox(candidate.bbox, page_result.width, page_result.height)
             image_b64 = self._crop_section_image_base64(page_result.page_image, normalized_bbox)
             sections.append(
