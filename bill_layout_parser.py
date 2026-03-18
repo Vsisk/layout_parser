@@ -93,6 +93,7 @@ class PageImage:
 class PageParseResult:
     page_index: int
     page_type: str
+    page_source_type: str
     width: float
     height: float
     blocks: list[Block]
@@ -187,33 +188,50 @@ class BillLayoutParser:
                 page = doc.load_page(page_index)
                 page_image = self._render_page(page, page_index)
                 pdf_blocks = self._extract_pdf_blocks(page, page_index)
+                page_source_type = self._classify_page_source_type(page, pdf_blocks)
 
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_img:
                     tmp_img.write(page_image.image_bytes)
                     tmp_img.flush()
                     img_path = tmp_img.name
 
-                    ocr_layout_blocks = self._call_ocr_processor(img_path, page_index)
+                    if page_source_type == "image_based":
+                        ocr_layout_blocks = self._call_ocr_processor(img_path, page_index)
+                        llm_pdf_blocks: list[Block] = []
+                    else:
+                        ocr_layout_blocks = []
+                        llm_pdf_blocks = pdf_blocks
 
                     try:
-                        raw_blocks = self._build_raw_blocks(page_index, page_image, pdf_blocks, ocr_layout_blocks)
+                        raw_blocks = self._build_raw_blocks(
+                            page_index=page_index,
+                            page_image=page_image,
+                            pdf_text_blocks=llm_pdf_blocks,
+                            ocr_layout_blocks=ocr_layout_blocks,
+                            page_source_type=page_source_type,
+                        )
                         llm_result = self._call_llm(raw_blocks=raw_blocks, img_path=img_path)
                         page_type = str(llm_result.get("page_type", "bill_summary_page"))
                         section_candidates = llm_result.get("sections", [])
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.warning("LLM call/parse failed; fallback enabled: %s", exc)
-                        page_type = self._infer_page_type(pdf_blocks + ocr_layout_blocks)
+                        primary_blocks = llm_pdf_blocks if page_source_type == "text_based" else ocr_layout_blocks
+                        page_type = self._infer_page_type(primary_blocks)
                         section_candidates = []
 
                 if page_type not in _ALLOWED_PAGE_TYPES:
-                    page_type = self._infer_page_type(pdf_blocks + ocr_layout_blocks)
+                    primary_blocks = llm_pdf_blocks if page_source_type == "text_based" else ocr_layout_blocks
+                    page_type = self._infer_page_type(primary_blocks)
+
+                final_blocks = llm_pdf_blocks if page_source_type == "text_based" else ocr_layout_blocks
 
                 parsed_page = PageParseResult(
                     page_index=page_index,
                     page_type=page_type,
+                    page_source_type=page_source_type,
                     width=float(page.rect.width),
                     height=float(page.rect.height),
-                    blocks=self._merge_pdf_and_ocr_blocks(pdf_blocks, ocr_layout_blocks),
+                    blocks=final_blocks,
                     section_candidates=section_candidates,
                     page_image=page_image,
                 )
@@ -288,13 +306,48 @@ class BillLayoutParser:
             blocks.append(Block(f"p{page_index}_ocr{idx}", "", bbox, page_index, "ocr_layout", label, score))
         return blocks
 
-    def _build_raw_blocks(self, page_index: int, page_image: PageImage, pdf_text_blocks: list[Block], ocr_layout_blocks: list[Block]) -> dict[str, Any]:
+    def _build_raw_blocks(
+        self,
+        page_index: int,
+        page_image: PageImage,
+        pdf_text_blocks: list[Block],
+        ocr_layout_blocks: list[Block],
+        page_source_type: Literal["text_based", "image_based"],
+    ) -> dict[str, Any]:
         return {
             "page_index": page_index,
+            "page_source_type": page_source_type,
             "page_size": {"width": page_image.width, "height": page_image.height},
             "pdf_text_blocks": [{"block_id": b.block_id, "text": b.text, "bbox": b.bbox} for b in pdf_text_blocks],
             "ocr_layout_blocks": [{"block_id": b.block_id, "bbox": b.bbox, "block_type": b.block_type, "confidence": b.confidence} for b in ocr_layout_blocks],
         }
+
+    def _classify_page_source_type(self, page: Any, pdf_blocks: list[Block]) -> Literal["text_based", "image_based"]:
+        non_empty_text_blocks = len(pdf_blocks)
+        total_chars = sum(len(b.text.strip()) for b in pdf_blocks)
+        text_coverage = self._estimate_text_coverage(pdf_blocks, float(page.rect.width), float(page.rect.height))
+
+        if non_empty_text_blocks == 0:
+            return "image_based"
+        if total_chars <= 5 and text_coverage < 0.002:
+            return "image_based"
+        if total_chars < 30 and non_empty_text_blocks <= 2 and text_coverage < 0.008:
+            return "image_based"
+        if non_empty_text_blocks >= 8 or total_chars >= 120:
+            return "text_based"
+        if non_empty_text_blocks >= 3 and total_chars >= 40 and text_coverage >= 0.01:
+            return "text_based"
+        return "image_based"
+
+    def _estimate_text_coverage(self, pdf_blocks: list[Block], page_width: float, page_height: float) -> float:
+        page_area = max(page_width * page_height, 1.0)
+        covered = 0.0
+        for block in pdf_blocks:
+            clipped = self._clip_bbox(block.bbox, page_width, page_height)
+            w = max(0.0, clipped[2] - clipped[0])
+            h = max(0.0, clipped[3] - clipped[1])
+            covered += (w * h)
+        return max(0.0, min(1.0, covered / page_area))
 
     def _call_llm(self, raw_blocks: dict[str, Any], img_path: str) -> dict[str, Any]:
         runner_class = self._get_agent_runner_class()

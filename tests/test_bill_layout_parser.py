@@ -99,13 +99,25 @@ def test_invalid_pdf_path() -> None:
 def test_parse_minimal_pdf_with_mocked_services(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     pdf_path = tmp_path / "a.pdf"
     _create_stub_pdf(pdf_path)
-    _patch_doc(monkeypatch, [_FakePage([(10, 10, 200, 40, "subtotal")])])
+    _patch_doc(
+        monkeypatch,
+        [
+            _FakePage(
+                [
+                    (10, 10, 500, 80, "Monthly billing statement"),
+                    (10, 90, 500, 180, "Total charges and taxes"),
+                    (10, 190, 500, 290, "Account summary and service usage"),
+                ]
+            )
+        ],
+    )
 
     _FakeRunner.should_raise = False
     _FakeRunner.response_text = '{"page_type":"bill_charge_page","sections":[{"region_type":"bill_charge_page.charge_items","structure_type":"table","bbox":[10,10,300,200],"source_block_ids":["p0_b0"],"confidence":0.9}]}'
+    proc = _FakeProcessor([{"coordinate": [100, 100, 200, 180], "label": "text", "score": 0.98}])
     result = parse_bill_pdf(
         str(pdf_path),
-        {"ocr_processor": _FakeProcessor([{"coordinate": [100, 100, 200, 180], "label": "text", "score": 0.98}]), "agent_runner_class": _FakeRunner},
+        {"ocr_processor": proc, "agent_runner_class": _FakeRunner},
     )
 
     assert len(result["output_data"]) == 1
@@ -114,6 +126,26 @@ def test_parse_minimal_pdf_with_mocked_services(monkeypatch: pytest.MonkeyPatch,
     assert call_args["prompt_template"] == ["layoutDetection"]
     assert call_args["llm_name"] == "VL"
     assert "blocks" in call_args
+    assert call_args["blocks"]["page_source_type"] == "text_based"
+    assert call_args["blocks"]["ocr_layout_blocks"] == []
+    assert proc.called_with is None
+
+
+def test_image_based_page_calls_ocr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    pdf_path = tmp_path / "a1.pdf"
+    _create_stub_pdf(pdf_path)
+    _patch_doc(monkeypatch, [_FakePage([])])
+
+    _FakeRunner.should_raise = False
+    _FakeRunner.response_text = '{"page_type":"bill_summary_page","sections":[]}'
+    proc = _FakeProcessor([{"coordinate": [100, 100, 200, 180], "label": "text", "score": 0.98}])
+    result = parse_bill_pdf(str(pdf_path), {"ocr_processor": proc, "agent_runner_class": _FakeRunner})
+
+    assert len(result["output_data"]) == 1
+    assert proc.called_with is not None
+    assert _FakeRunner.last_kwargs["blocks"]["page_source_type"] == "image_based"
+    assert _FakeRunner.last_kwargs["blocks"]["pdf_text_blocks"] == []
+    assert isinstance(result["output_data"][0]["page_sections"], list)
 
 
 def test_blank_page_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
